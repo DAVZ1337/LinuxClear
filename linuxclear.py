@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -23,6 +22,9 @@ TEMP_DIRS = (
     Path("/var/tmp"),
 )
 
+# Variable global para rastrear el espacio eliminado
+cleaned_size = 0
+
 
 def is_root():
     """Comprueba si el programa se ejecuta como administrador."""
@@ -41,6 +43,15 @@ def target_home():
             pass
 
     return Path.home()
+
+
+def format_size(size_bytes):
+    """Convierte bytes a formato legible (B, KB, MB, GB)."""
+    for unit in ["B", "KB", "MB", "GB"]:
+        if size_bytes < 1024:
+            return f"{size_bytes:.2f} {unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.2f} TB"
 
 
 def print_banner():
@@ -115,12 +126,37 @@ def system_info():
         print("[INFO] No se pudo consultar la carga del sistema.")
 
 
+def get_path_size(path):
+    """Calcula el tamaño total de una ruta (archivo o directorio)."""
+    try:
+        if path.is_symlink() or path.is_file():
+            return path.stat().st_size
+        elif path.is_dir():
+            total = 0
+            for entry in path.rglob("*"):
+                try:
+                    if entry.is_file() and not entry.is_symlink():
+                        total += entry.stat().st_size
+                except OSError:
+                    continue
+            return total
+    except OSError:
+        return 0
+    return 0
+
+
 def remove_path(path, apply=False):
     """Elimina una ruta concreta únicamente al activar --apply."""
+    global cleaned_size
+    
     if not apply:
-        print(f"[DRY-RUN] Se limpiaría: {path}")
+        size = get_path_size(path)
+        print(f"[DRY-RUN] Se limpiaría: {path} ({format_size(size)})")
+        cleaned_size += size
         return
 
+    size = get_path_size(path)
+    
     try:
         if path.is_symlink() or path.is_file():
             path.unlink()
@@ -129,7 +165,8 @@ def remove_path(path, apply=False):
         else:
             return
 
-        print(f"[OK] Limpiado: {path}")
+        print(f"[OK] Limpiado: {path} ({format_size(size)})")
+        cleaned_size += size
 
     except OSError as exc:
         print(f"[WARN] No se pudo limpiar {path}: {exc}")
@@ -239,6 +276,8 @@ def validate_compatibility():
 
 
 def main():
+    global cleaned_size
+    
     parser = argparse.ArgumentParser(
         description=(
             "LinuxClear: limpieza conservadora de cachés "
@@ -337,6 +376,7 @@ def main():
         print("No se ha borrado nada.")
         print("Revisa la lista antes de utilizar --apply.")
 
+    print(f"\n[RESUMEN] Espacio liberado: {format_size(cleaned_size)}")
     print("LinuxClear no elimina kernels ni desactiva servicios.")
     print("========================================")
 
