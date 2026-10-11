@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-LinuxClear v1.1.1
+LinuxClear v1.1.2
 Herramienta conservadora de limpieza para Linux.
 La vista previa está activada por defecto.
 """
@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from dataclasses import dataclass, field
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 
 TEMP_DIRS = (
     Path("/tmp"),
@@ -28,17 +28,37 @@ ROOT_FILESYSTEM = Path("/")
 
 
 @dataclass
+class DiskSnapshot:
+    """Captura el estado del disco en un momento."""
+    total: int = 0
+    used: int = 0
+    free: int = 0
+    available: bool = False
+
+    def is_valid(self):
+        """Comprueba si la captura es válida."""
+        return self.available and self.total > 0
+
+
+@dataclass
 class CleanupStats:
-    """Estadísticas de limpieza."""
+    """Estadísticas de limpieza con mediciones fiables."""
+    # Estimaciones previas
     estimated_size: int = 0
-    actual_removed_size: int = 0
+    
+    # Operaciones exitosas
     files_removed: int = 0
     dirs_removed: int = 0
+    actual_removed_size: int = 0
+    
+    # Operaciones fallidas/omitidas
     failed_operations: int = 0
     skipped_operations: int = 0
     failed_items: list = field(default_factory=list)
-    disk_space_before: int = 0
-    disk_space_after: int = 0
+    
+    # Mediciones de disco
+    disk_before: DiskSnapshot = field(default_factory=DiskSnapshot)
+    disk_after: DiskSnapshot = field(default_factory=DiskSnapshot)
 
 
 def is_root():
@@ -62,30 +82,37 @@ def target_home():
 
 def format_size(size_bytes):
     """Convierte bytes a formato legible (B, KB, MB, GB, TB)."""
-    if size_bytes < 0:
+    if size_bytes is None or size_bytes < 0:
         return "0 B"
     
+    size_float = float(size_bytes)
     for unit in ["B", "KB", "MB", "GB"]:
-        if size_bytes < 1024:
-            return f"{size_bytes:.2f} {unit}"
-        size_bytes /= 1024
-    return f"{size_bytes:.2f} TB"
+        if size_float < 1024:
+            return f"{size_float:.2f} {unit}"
+        size_float /= 1024
+    return f"{size_float:.2f} TB"
 
 
-def get_disk_usage(path=None):
+def capture_disk_usage(path=None):
     """
-    Obtiene el uso de disco de forma fiable con shutil.disk_usage.
-    Retorna (total, usado, libre) en bytes.
+    Captura el uso de disco de forma fiable.
+    Retorna un DiskSnapshot con las mediciones.
     """
     if path is None:
         path = ROOT_FILESYSTEM
     
+    snapshot = DiskSnapshot()
     try:
         usage = shutil.disk_usage(str(path))
-        return (usage.total, usage.used, usage.free)
+        snapshot.total = usage.total
+        snapshot.used = usage.used
+        snapshot.free = usage.free
+        snapshot.available = True
     except OSError as exc:
         print(f"[WARN] No se pudo consultar el espacio en disco: {exc}")
-        return None
+        snapshot.available = False
+    
+    return snapshot
 
 
 def print_banner():
@@ -158,12 +185,34 @@ def system_info():
 def is_safe_path(target, base):
     """
     Comprueba que target está dentro de base y no es un enlace simbólico.
-    Previene seguir enlaces fuera de la ruta prevista.
+    No resuelve el enlace antes de validar.
+    Retorna False si la ruta es insegura o inaccesible.
     """
     try:
-        target = target.resolve()
-        base = base.resolve()
-        return target.is_relative_to(base) and not target.is_symlink()
+        # Verificar que target existe y es accesible
+        if not target.exists():
+            return False
+        
+        # Rechazar enlaces simbólicos inmediatamente
+        if target.is_symlink():
+            return False
+        
+        # Resolver ambas rutas para la comprobación de contención
+        target_resolved = target.resolve()
+        base_resolved = base.resolve()
+        
+        # Verificar que target resuelto sigue siendo un archivo normal
+        # (no un enlace que apunte afuera)
+        if target_resolved.is_symlink():
+            return False
+        
+        # Comprobación de contención
+        try:
+            target_resolved.relative_to(base_resolved)
+            return True
+        except ValueError:
+            return False
+        
     except (OSError, ValueError):
         return False
 
@@ -172,24 +221,34 @@ def get_path_size(path):
     """
     Calcula el tamaño total de una ruta (archivo o directorio).
     No sigue enlaces simbólicos.
+    Retorna el tamaño en bytes o 0 si no se puede calcular.
     """
     try:
+        # Rechazar enlaces simbólicos
         if path.is_symlink():
             return 0
         
+        # Archivo regular
         if path.is_file():
-            return path.stat().st_size
+            try:
+                return path.stat().st_size
+            except OSError:
+                return 0
         
+        # Directorio: sumar tamaño de archivos normales
         if path.is_dir():
             total = 0
             try:
                 for entry in path.rglob("*"):
                     try:
+                        # Solo contar archivos normales, no enlaces
                         if entry.is_file() and not entry.is_symlink():
                             total += entry.stat().st_size
                     except OSError:
+                        # Archivo inaccesible: ignorar
                         continue
             except (OSError, RecursionError):
+                # Error recorriendo directorio: retornar lo que se pudo calcular
                 pass
             return total
     except OSError:
@@ -201,32 +260,55 @@ def get_path_size(path):
 def remove_path(path, apply=False, stats=None):
     """
     Elimina una ruta concreta únicamente al activar --apply.
-    Retorna True si se eliminó correctamente, False en caso contrario.
+    Realiza validaciones de seguridad antes de eliminar.
+    Registra correctamente tamaños y operaciones.
+    Retorna True si se procesó sin errores, False en caso contrario.
     """
     if stats is None:
         stats = CleanupStats()
     
+    # Calcular tamaño ANTES de cualquier operación
     size = get_path_size(path)
     stats.estimated_size += size
     
+    # Modo vista previa: solo informar
     if not apply:
         print(f"[DRY-RUN] Se limpiaría: {path} ({format_size(size)})")
         return True
     
+    # Modo aplicar: verificación de seguridad adicional
     try:
+        # Comprobación final de que la ruta sigue siendo segura
         if path.is_symlink():
-            path.unlink()
-            stats.files_removed += 1
-        elif path.is_file():
+            # Rechazar enlaces (no seguir)
+            stats.failed_operations += 1
+            stats.failed_items.append((str(path), "Es un enlace simbólico"))
+            print(f"[WARN] Se rechazó {path}: es un enlace simbólico")
+            return False
+        
+        # Verificar que el tamaño pre-eliminación coincide
+        current_size = get_path_size(path)
+        if current_size != size:
+            print(f"[WARN] Cambio de tamaño detectado en {path} "
+                  f"(antes: {format_size(size)}, ahora: {format_size(current_size)})")
+            # Usar el tamaño actual
+            stats.estimated_size -= size
+            stats.estimated_size += current_size
+            size = current_size
+        
+        # Eliminar
+        if path.is_file():
             path.unlink()
             stats.files_removed += 1
         elif path.is_dir():
-            shutil.rmtree(path, ignore_errors=False)
+            shutil.rmtree(path)
             stats.dirs_removed += 1
         else:
+            # Tipo de archivo desconocido
             stats.skipped_operations += 1
             return False
         
+        # Solo contar como eliminado si la operación fue exitosa
         stats.actual_removed_size += size
         print(f"[OK] Limpiado: {path} ({format_size(size)})")
         return True
@@ -242,6 +324,7 @@ def clean_user_cache(home, apply=False, stats=None):
     """
     Limpia las entradas de la caché del usuario.
     No elimina el directorio .cache en sí, solo su contenido.
+    Evita seguir enlaces simbólicos.
     """
     if stats is None:
         stats = CleanupStats()
@@ -254,6 +337,7 @@ def clean_user_cache(home, apply=False, stats=None):
         print(f"[INFO] No existe: {cache}")
         return stats
 
+    # Validación de seguridad: .cache debe estar en el home
     if not is_safe_path(cache, home):
         print(f"[ERROR] La ruta de caché no es segura: {cache}")
         stats.failed_operations += 1
@@ -287,7 +371,7 @@ def clean_old_temp_files(days=7, apply=False, stats=None):
     cutoff = time.time() - (days * 24 * 60 * 60)
 
     print(f"\n[INFO] Archivos temporales con más de {days} días")
-    print("[AVISO] Archivos antiguos pueden estar en uso.")
+    print("[AVISO] Archivos antiguos pueden estar en uso deliberadamente.")
 
     for directory in TEMP_DIRS:
         if not directory.is_dir():
@@ -299,6 +383,7 @@ def clean_old_temp_files(days=7, apply=False, stats=None):
                 followlinks=False,
             ):
                 # Evita recorrer directorios que sean enlaces simbólicos.
+                # Modifica dirs in-place para evitar descender en ellos.
                 dirs[:] = [
                     name
                     for name in dirs
@@ -309,6 +394,7 @@ def clean_old_temp_files(days=7, apply=False, stats=None):
                     path = Path(root) / name
 
                     try:
+                        # Doble comprobación: rechazar enlaces
                         if path.is_symlink() or not path.is_file():
                             continue
 
@@ -341,14 +427,14 @@ def apt_cleanup(apply=False, stats=None):
 
     print("\n[INFO] Limpieza de caché APT")
 
-    # apt-get clean
+    # apt-get clean: elimina archivos de caché antiguos
     ret1 = run(["apt-get", "clean"], apply=apply)
     if apply and ret1 != 0:
         stats.failed_operations += 1
     elif apply:
         print("[OK] apt-get clean completado.")
     
-    # apt-get autoclean
+    # apt-get autoclean: elimina solo los archivos de .deb no instalados
     ret2 = run(["apt-get", "autoclean"], apply=apply)
     if apply and ret2 != 0:
         stats.failed_operations += 1
@@ -361,7 +447,8 @@ def apt_cleanup(apply=False, stats=None):
 def journal_cleanup(apply=False, stats=None):
     """
     Reduce el journal de systemd a los registros recientes (14 días).
-    Esto elimina registros antiguos, no todos.
+    Esto elimina registros ANTIGUOS, no todos.
+    Los registros elimados pueden ser irrecuperables.
     """
     if stats is None:
         stats = CleanupStats()
@@ -372,7 +459,7 @@ def journal_cleanup(apply=False, stats=None):
         return stats
 
     print("\n[INFO] Conservación del journal: últimos 14 días")
-    print("[INFO] Se eliminarán registros anteriores a 14 días.")
+    print("[AVISO] Se eliminarán PERMANENTEMENTE registros anteriores a 14 días.")
 
     ret = run(
         ["journalctl", "--vacuum-time=14d"],
@@ -398,8 +485,10 @@ def validate_compatibility():
     if not is_root():
         print("[ERROR] Ejecuta el programa con sudo.")
         print("Ejemplo: sudo python3 linuxclear.py")
-        print("\nNota: Se requieren permisos de administrador para limpiar")
-        print("cachés de sistema y archivos en /tmp y /var/tmp.")
+        print("\nNota: Se requieren permisos de administrador para:")
+        print("  - Acceder a cachés de sistema.")
+        print("  - Limpiar archivos en /tmp y /var/tmp.")
+        print("  - Gestionar el journal de systemd.")
         return False
 
     return True
@@ -407,87 +496,108 @@ def validate_compatibility():
 
 def print_summary(stats, apply=False, level="quick"):
     """Imprime un resumen detallado de la limpieza."""
-    print("\n" + "=" * 50)
-    print("RESUMEN DE LIMPIEZA")
-    print("=" * 50)
+    print("\n" + "=" * 60)
+    print("RESUMEN DE LIMPIEZA - LinuxClear v" + VERSION)
+    print("=" * 60)
 
-    # Información antes
-    if stats.disk_space_before > 0:
-        total, used_before, free_before = stats.disk_space_before, None, None
-        disk_info = get_disk_usage()
-        if disk_info:
-            total, used_before, free_before = disk_info
-        
-        print(f"\n[ANTES]")
-        print(f"  Espacio total:    {format_size(total)}")
-        if used_before is not None:
-            print(f"  Espacio usado:    {format_size(used_before)}")
-            print(f"  Espacio libre:    {format_size(free_before)}")
-            percent = (used_before / total * 100) if total > 0 else 0
-            print(f"  Ocupación:        {percent:.1f}%")
+    # === ESTADO ANTES ===
+    if stats.disk_before.is_valid():
+        print(f"\n[ESTADO ANTES]")
+        print(f"  Espacio total:    {format_size(stats.disk_before.total)}")
+        print(f"  Espacio usado:    {format_size(stats.disk_before.used)}")
+        print(f"  Espacio libre:    {format_size(stats.disk_before.free)}")
+        percent = (stats.disk_before.used / stats.disk_before.total * 100) \
+                  if stats.disk_before.total > 0 else 0
+        print(f"  Porcentaje usado: {percent:.1f}%")
+    else:
+        print(f"\n[ESTADO ANTES]")
+        print(f"  No disponible")
 
-    # Estimaciones
-    print(f"\n[ESTIMACIONES]")
-    print(f"  Tamaño estimado:  {format_size(stats.estimated_size)}")
+    # === RESULTADO DE LA LIMPIEZA ===
+    print(f"\n[RESULTADO DE LA LIMPIEZA]")
+    print(f"  Tamaño estimado:          {format_size(stats.estimated_size)}")
+    print(f"  Archivos eliminados:      {stats.files_removed}")
+    print(f"  Directorios eliminados:   {stats.dirs_removed}")
+    print(f"  Tamaño registrado elim.:  {format_size(stats.actual_removed_size)}")
+    
+    if stats.failed_operations > 0:
+        print(f"  Operaciones fallidas:     {stats.failed_operations}")
+        if stats.failed_items:
+            print(f"\n[DETALLES DE ERRORES]")
+            for item, error in stats.failed_items[:5]:  # Mostrar máx 5
+                print(f"    ✗ {item}")
+                print(f"      → {error}")
+            if len(stats.failed_items) > 5:
+                print(f"    ... y {len(stats.failed_items) - 5} errores más")
+    
+    if stats.skipped_operations > 0:
+        print(f"  Operaciones omitidas:     {stats.skipped_operations}")
 
-    # Operaciones realizadas
+    # === ESTADO DESPUÉS ===
     if apply:
-        print(f"\n[OPERACIONES COMPLETADAS]")
-        print(f"  Archivos eliminados:     {stats.files_removed}")
-        print(f"  Directorios eliminados:  {stats.dirs_removed}")
-        print(f"  Espacio eliminado real:  {format_size(stats.actual_removed_size)}")
-        
-        if stats.failed_operations > 0:
-            print(f"  Operaciones fallidas:    {stats.failed_operations}")
-            if stats.failed_items:
-                print("\n[ERRORES]")
-                for item, error in stats.failed_items[:10]:  # Mostrar máx 10
-                    print(f"    - {item}")
-                    print(f"      {error}")
-                if len(stats.failed_items) > 10:
-                    print(f"    ... y {len(stats.failed_items) - 10} errores más")
-        
-        if stats.skipped_operations > 0:
-            print(f"  Operaciones omitidas:    {stats.skipped_operations}")
+        if stats.disk_after.is_valid():
+            print(f"\n[ESTADO DESPUÉS]")
+            print(f"  Espacio total:    {format_size(stats.disk_after.total)}")
+            print(f"  Espacio usado:    {format_size(stats.disk_after.used)}")
+            print(f"  Espacio libre:    {format_size(stats.disk_after.free)}")
+            percent_after = (stats.disk_after.used / stats.disk_after.total * 100) \
+                           if stats.disk_after.total > 0 else 0
+            print(f"  Porcentaje usado: {percent_after:.1f}%")
 
-        # Información después
-        disk_info_after = get_disk_usage()
-        if disk_info_after:
-            total, used_after, free_after = disk_info_after
-            print(f"\n[DESPUÉS]")
-            print(f"  Espacio total:    {format_size(total)}")
-            print(f"  Espacio usado:    {format_size(used_after)}")
-            print(f"  Espacio libre:    {format_size(free_after)}")
-            percent_after = (used_after / total * 100) if total > 0 else 0
-            print(f"  Ocupación:        {percent_after:.1f}%")
-
-            # Diferencia real
-            if stats.disk_space_before > 0:
-                real_freed = stats.disk_space_before - (total - free_after)
-                print(f"\n[DIFERENCIA REAL]")
-                print(f"  Espacio liberado: {format_size(real_freed)}")
-                print(f"  Nota: Esta medida puede variar por actividad")
-                print(f"  concurrente, archivos abiertos o del sistema.")
+            # === CAMBIO MEDIDO DE ESPACIO LIBRE ===
+            if stats.disk_before.is_valid():
+                free_change = stats.disk_after.free - stats.disk_before.free
+                print(f"\n[CAMBIO MEDIDO DEL ESPACIO LIBRE]")
+                print(f"  Diferencia:       {format_size(free_change)}")
+                
+                if free_change < 0:
+                    print(f"  Estado:           El espacio libre DISMINUYÓ")
+                    print(f"  Posible causa:    El sistema generó nuevos archivos")
+                    print(f"                    durante la limpieza, o hay caché")
+                    print(f"                    del sistema que se regenera.")
+                elif free_change == 0:
+                    print(f"  Estado:           Sin cambios en espacio libre")
+                else:
+                    print(f"  Estado:           Espacio liberado correctamente")
+                
+                print(f"\n  ⓘ NOTA IMPORTANTE:")
+                print(f"    • Esta medida incluye cambios concurrentes del SO")
+                print(f"    • Archivos abiertos pueden impedir su eliminación")
+                print(f"    • El espacio fragmentado y metadatos pueden variar")
+                print(f"    • No toda la diferencia es atribuible a LinuxClear")
+        else:
+            print(f"\n[ESTADO DESPUÉS]")
+            print(f"  No disponible")
     else:
         print(f"\n[MODO VISTA PREVIA]")
-        print(f"  No se ha eliminado nada.")
-        print(f"  Revisa las cantidades antes de usar --apply.")
+        print(f"  ✓ No se ha eliminado nada")
+        print(f"  • Los tamaños mostrados arriba son ESTIMACIONES")
+        print(f"  • Para aplicar la limpieza, usa: --apply")
+        print(f"  • Revisa los elementos antes de usar --apply")
         if stats.skipped_operations > 0:
-            print(f"  Tareas omitidas: {stats.skipped_operations}")
+            print(f"  • Tareas omitidas: {stats.skipped_operations}")
 
-    # Notas finales
-    print(f"\n[INFORMACIÓN]")
-    print(f"  Nivel de limpieza: {level}")
-    print(f"  Kernel y servicios: Sin cambios")
-    print(f"  Paquetes instalados: Sin cambios")
-    print("=" * 50)
+    # === INFORMACIÓN ADICIONAL ===
+    print(f"\n[INFORMACIÓN DEL PROGRAMA]")
+    print(f"  Versión:                  LinuxClear {VERSION}")
+    print(f"  Modo de ejecución:        {'APLICAR CAMBIOS' if apply else 'VISTA PREVIA'}")
+    print(f"  Nivel de limpieza:        {level.upper()}")
+    print(f"  Permisos del administrador: {'Sí' if is_root() else 'No'}")
+    print(f"\n[LÍMITES Y GARANTÍAS]")
+    print(f"  ✓ No se han desinstalado paquetes")
+    print(f"  ✓ No se ha modificado el kernel")
+    print(f"  ✓ No se han desactivado servicios")
+    print(f"  ✓ No se han modificado permisos recursivos")
+    print(f"  ✓ No se han seguido enlaces simbólicos")
+    
+    print("=" * 60)
 
 
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "LinuxClear v1.1.1: limpieza conservadora de cachés "
-            "y archivos temporales en Linux."
+            "LinuxClear v1.1.2: limpieza conservadora de cachés "
+            "y archivos temporales en Linux. Vista previa por defecto."
         )
     )
 
@@ -496,8 +606,8 @@ def main():
         choices=["quick", "deep"],
         default="quick",
         help=(
-            "quick: caché del usuario y APT (por defecto). "
-            "deep: añade temporales antiguos y journal."
+            "quick (por defecto): caché del usuario y APT. "
+            "deep: añade temporales antiguos y journal de systemd."
         ),
     )
 
@@ -518,13 +628,14 @@ def main():
         type=int,
         default=7,
         metavar="DIAS",
-        help="Antigüedad mínima de archivos temporales en nivel deep (por defecto 7).",
+        help="Antigüedad mínima de archivos temporales en nivel deep (mínimo: 1, por defecto: 7).",
     )
 
     args = parser.parse_args()
 
+    # Validaciones
     if args.temp_days < 1:
-        parser.error("--temp-days debe ser al menos 1.")
+        parser.error("--temp-days debe ser al menos 1 día.")
 
     if args.yes and not args.apply:
         parser.error("--yes requiere --apply.")
@@ -537,10 +648,10 @@ def main():
     # Inicializar estadísticas
     stats = CleanupStats()
     
-    # Medir espacio antes
-    disk_before = get_disk_usage()
-    if disk_before:
-        stats.disk_space_before = disk_before[2]  # Espacio libre
+    # CAPTURA 1: Medir espacio ANTES de cualquier operación
+    stats.disk_before = capture_disk_usage()
+    if not stats.disk_before.is_valid():
+        print("[WARN] No se pudo medir el espacio del disco.")
 
     home = target_home()
 
@@ -553,6 +664,7 @@ def main():
 
     system_info()
 
+    # Confirmación interactiva (solo si --apply y no --yes)
     if args.apply and not args.yes:
         try:
             answer = input(
@@ -560,13 +672,15 @@ def main():
                 "Escribe SI para continuar: "
             )
         except (EOFError, KeyboardInterrupt):
-            print("\n[INFO] Operación cancelada.")
+            print("\n[INFO] Operación cancelada por el usuario.")
             return 1
 
         if answer.strip() != "SI":
             print("[INFO] Operación cancelada. No se han aplicado cambios.")
             return 0
 
+    # === OPERACIONES DE LIMPIEZA ===
+    
     # Limpieza de caché del usuario
     clean_user_cache(home, apply=args.apply, stats=stats)
 
@@ -581,6 +695,12 @@ def main():
             stats=stats,
         )
         journal_cleanup(apply=args.apply, stats=stats)
+
+    # CAPTURA 2: Medir espacio DESPUÉS de todas las operaciones (solo si --apply)
+    if args.apply:
+        stats.disk_after = capture_disk_usage()
+        if not stats.disk_after.is_valid():
+            print("[WARN] No se pudo medir el espacio del disco después de la limpieza.")
 
     # Resumen final
     print_summary(stats, apply=args.apply, level=args.level)
